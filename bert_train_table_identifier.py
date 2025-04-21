@@ -36,6 +36,7 @@ def load_global_schema(tables_json_path):
 # But itll do for now)
 # Right now it does not allow columns to be added to the second table found - and i cannot for the life of
 # me get it to work - so this is what it is for now!
+#TODO: Fix the fact that it also sees shorthands for tabels such as t1 and t3 as real table names - god this fucking sucks
 def parse_schema(sql: str):
     stmt = sqlparse.parse(sql[0])[0]
     tables, columns = [], {}
