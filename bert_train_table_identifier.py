@@ -17,7 +17,7 @@ def load_global_schema(tables_json_path):
     for db in all_dbs:
         db_id = db['db_id']
         tables = db['table_names']
-        cols   = db['column_names'] 
+        cols = db['column_names'] 
         tbl2cols = defaultdict(list)
         for tbl_idx, col_name in cols:
             if tbl_idx >= 0:
@@ -60,8 +60,8 @@ def load_questions(jsonl_path):
 def build_linking_examples(recs, global_schema, neg_ratio=1):
     examples = []
     for r in recs:
-        q   = r['question']
-        db  = r['db_id']
+        q = r['question']
+        db = r['db_id']
         local_t, local_c = parse_schema(r['schema'])
 
         pos = local_t + [f"{t}.{c}" for t in local_t for c in local_c[t]]
@@ -107,21 +107,21 @@ class LinkDataset(Dataset):
             return_tensors='pt'
         )
         return {
-            'input_ids':      enc['input_ids'].squeeze(0),
+            'input_ids': enc['input_ids'].squeeze(0),
             'attention_mask': enc['attention_mask'].squeeze(0),
-            'labels':         torch.tensor(lbl)
+            'labels': torch.tensor(lbl)
         }
     
 
 def train_linker(examples, output_dir='linker_out'):
-    tok   = BertTokenizerFast.from_pretrained('bert-base-uncased')
-    ds    = LinkDataset(examples, tok)
+    tok = BertTokenizerFast.from_pretrained('bert-base-uncased')
+    ds = LinkDataset(examples, tok)
     model = BertForSequenceClassification.from_pretrained(
         'bert-base-uncased',
         num_labels=1,
         problem_type='regression'
     )
-    args  = TrainingArguments(
+    args = TrainingArguments(
         output_dir=output_dir,
         per_device_train_batch_size=32,
         num_train_epochs=3,
@@ -147,7 +147,7 @@ def prune_elements(question, candidate_elements, model, tokenizer, theta=0.5):
         return_tensors='pt'
     )
     logits = model(**enc).logits.squeeze(-1)
-    probs  = torch.sigmoid(logits).tolist()
+    probs = torch.sigmoid(logits).tolist()
     return {
         e: p for e, p in zip(candidate_elements, probs)
         if p >= theta
@@ -159,7 +159,7 @@ if __name__ == '__main__':
     QUESTIONS_JL= './questions.jsonl'
 
     global_schema = load_global_schema(TABLES_JSON)
-    recs          = load_questions(QUESTIONS_JL)
+    recs = load_questions(QUESTIONS_JL)
 
     examples = build_linking_examples(recs, global_schema, neg_ratio=1)
     model, tok = train_linker(examples, output_dir='linker_out')
