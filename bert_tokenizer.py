@@ -9,9 +9,9 @@ with open('questions.jsonl','r') as f:
         db_ids.append(rec['db_id'])
 
 
-db_list  = sorted(set(db_ids))
+db_list = sorted(set(db_ids))
 label2id = {db:i for i, db in enumerate(db_list)}
-labels   = [label2id[db] for db in db_ids]
+labels = [label2id[db] for db in db_ids]
 
 with open("db_classifier/label2id.json","w") as f:
     json.dump(label2id, f)

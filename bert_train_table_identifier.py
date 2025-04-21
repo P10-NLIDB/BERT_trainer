@@ -3,6 +3,11 @@ import random
 from collections import defaultdict
 import torch
 from torch.utils.data import Dataset
+import sqlparse
+from sqlparse.sql import IdentifierList, Identifier, Function
+from sqlparse.tokens import DML, Keyword, Punctuation
+from typing import List, Tuple, Dict
+import re
 from transformers import (
     BertTokenizerFast,
     BertForSequenceClassification,
@@ -10,6 +15,7 @@ from transformers import (
     TrainingArguments
 )
 
+# Load all tables and columns for all databses in Spider
 def load_global_schema(tables_json_path):
     with open(tables_json_path, 'r') as f:
         all_dbs = json.load(f)
@@ -25,28 +31,70 @@ def load_global_schema(tables_json_path):
         schema[db_id] = dict(tbl2cols)
     return schema
 
-def parse_schema(schema_str):
-    """
-    Input: schema string like
-      "department : creation , name , ... | head : head_id , years_old , ... | management : ..."
-    Output: 
-      tables = ["department","head","management"]
-      columns = {
-        "department": ["creation","name",...],
-        "head":       ["head_id","years_old",...],
-        "management":["department_id","head_id",...]
-      }
-    """
+# Parse schema elements from SQL statement - First identify all tables af From
+# Then all columns after select (Might not encompass everything and be somewhat fucking dumb
+# But itll do for now)
+def parse_schema(sql: str):
+    stmt = sqlparse.parse(sql[0])[0]
     tables, columns = [], {}
-    for part in schema_str.split('|'):
-        if ':' not in part:
+    in_from = False
+    in_select = False
+    for token in stmt.tokens:
+        if token.ttype is Keyword and token.value.upper() == 'FROM':
+            nxt = stmt.token_next(stmt.token_index(token), skip_ws=True)[1]
+            if isinstance(nxt, IdentifierList):
+                for ident in nxt.get_identifiers():
+                    tables.append(ident.get_real_name())
+            elif isinstance(nxt, Identifier):
+                tables.append(nxt.get_real_name())
+
+    select_idx = next(i for i, t in enumerate(stmt.tokens) if t.ttype is DML and t.value.upper()=='SELECT')
+    from_idx   = next(i for i, t in enumerate(stmt.tokens) if t.ttype is Keyword and t.value.upper()=='FROM')
+
+    for token in stmt.tokens[select_idx+1:from_idx]:
+        if token.is_whitespace or token.match(Punctuation, ','):
             continue
-        table, collist = part.split(':', 1)
-        table = table.strip()
-        cols = [c.strip() for c in collist.split(',') if c.strip()]
-        tables.append(table)
-        columns[table] = cols
-    return tables, columns
+
+        if isinstance(token, IdentifierList):
+            for ident in token.get_identifiers():
+                try:
+                    col = ident.get_real_name()
+                except AttributeError:
+                    continue
+                tbl = ident.get_parent_name() or (tables[0] if len(tables)==1 else None)
+                if tbl:
+                    if tbl in columns:
+                        columns[tbl].append(col)
+                    else:
+                        columns[tbl] = [col]
+
+        elif isinstance(token, Identifier):
+            col = token.get_real_name()
+            tbl = token.get_parent_name() or (tables[0] if len(tables)==1 else None)
+            if tbl and tbl in columns:
+                        columns[tbl].append(col)
+            elif tbl:
+                columns[tbl] = [col]
+
+        elif isinstance(token, Function):
+            inside = re.search(r'\(([^)]+)\)', token.value)
+            if not inside: 
+                continue
+            args = inside.group(1).split(',')
+            for arg in args:
+                arg = arg.strip()
+                if '.' in arg:
+                    tbl, col = arg.split('.', 1)
+                else:
+                    col = arg
+                    tbl = tables[0] if len(tables)==1 else None
+                if tbl and tbl in columns:
+                        columns[tbl].append(col)
+                elif tbl:
+                    columns[tbl] = [col]
+        print(tables, columns)
+
+    return tables, dict(columns)
 
 
 
@@ -57,14 +105,20 @@ def load_questions(jsonl_path):
             recs.append(json.loads(line))
     return recs
 
+# Build positive and negative examples for training - ration controls the ratio of negative examples to
+# positives 
 def build_linking_examples(recs, global_schema, neg_ratio=1):
     examples = []
     for r in recs:
         q = r['question']
         db = r['db_id']
-        local_t, local_c = parse_schema(r['schema'])
+        local_t, local_c = parse_schema(r['queries'])
 
-        pos = local_t + [f"{t}.{c}" for t in local_t for c in local_c[t]]
+        pos = local_t + [
+            f"{t}.{c}"
+            for t in local_t
+            for c in local_c.get(t, [])
+        ]
 
         all_tbls = list(global_schema[db].keys())
         all_cols = [f"{t}.{c}" for t in all_tbls for c in global_schema[db][t]]
@@ -85,7 +139,7 @@ def build_linking_examples(recs, global_schema, neg_ratio=1):
     return examples
 
 
-
+# Preproccesing of dataset for training
 class LinkDataset(Dataset):
     def __init__(self, examples, tokenizer, max_length=64):
         self.ex = examples
@@ -96,8 +150,8 @@ class LinkDataset(Dataset):
         return len(self.ex)
 
     def __getitem__(self, idx):
-        q  = self.ex[idx]['question']
-        e  = self.ex[idx]['element']
+        q = self.ex[idx]['question']
+        e = self.ex[idx]['element']
         lbl = float(self.ex[idx]['label'])
         enc = self.tok(
             q, e,
@@ -112,7 +166,7 @@ class LinkDataset(Dataset):
             'labels': torch.tensor(lbl)
         }
     
-
+# Link model trainer with dataset
 def train_linker(examples, output_dir='linker_out'):
     tok = BertTokenizerFast.from_pretrained('bert-base-uncased')
     ds = LinkDataset(examples, tok)
@@ -138,6 +192,7 @@ def train_linker(examples, output_dir='linker_out'):
     tok.save_pretrained(output_dir)
     return model, tok
 
+# Test if model works - theta is just pulled from thin air  - do not put to much thought into this
 def prune_elements(question, candidate_elements, model, tokenizer, theta=0.5):
     enc = tokenizer(
         [question]*len(candidate_elements),
