@@ -34,6 +34,8 @@ def load_global_schema(tables_json_path):
 # Parse schema elements from SQL statement - First identify all tables af From
 # Then all columns after select (Might not encompass everything and be somewhat fucking dumb
 # But itll do for now)
+# Right now it does not allow columns to be added to the second table found - and i cannot for the life of
+# me get it to work - so this is what it is for now!
 def parse_schema(sql: str):
     stmt = sqlparse.parse(sql[0])[0]
     tables, columns = [], {}
