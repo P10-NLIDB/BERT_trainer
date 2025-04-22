@@ -33,12 +33,6 @@ def load_global_schema(tables_json_path):
         schema[db_id] = dict(tbl2cols)
     return schema
 
-# Parse schema elements from SQL statement - First identify all tables af From
-# Then all columns after select (Might not encompass everything and be somewhat fucking dumb
-# But itll do for now)
-# Right now it does not allow columns to be added to the second table found - and i cannot for the life of
-# me get it to work - so this is what it is for now!
-
 
 def parse_schema(sql: str):
     stmt = sqlparse.parse(sql[0])[0]
@@ -175,36 +169,6 @@ class LinkDataset(Dataset):
             'labels': torch.tensor(lbl)
         }
 
-# Link model trainer with dataset
-
-
-def train_linker(examples, output_dir='linker_out'):
-    tok = BertTokenizerFast.from_pretrained('bert-base-uncased')
-    ds = LinkDataset(examples, tok)
-    model = BertForSequenceClassification.from_pretrained(
-        'bert-base-uncased',
-        num_labels=1,
-        problem_type='regression'
-    )
-    args = TrainingArguments(
-        output_dir=output_dir,
-        per_device_train_batch_size=32,
-        num_train_epochs=3,
-        learning_rate=3e-5,
-        logging_steps=100
-    )
-    trainer = Trainer(
-        model=model,
-        args=args,
-        train_dataset=ds
-    )
-    trainer.train()
-    model.save_pretrained(output_dir)
-    tok.save_pretrained(output_dir)
-    return model, tok
-
-# Test if model works - theta is just pulled from thin air  - do not put to much thought into this
-
 
 def prune_elements(question, candidate_elements, model, tokenizer, theta=0.5):
     enc = tokenizer(
@@ -224,25 +188,44 @@ def prune_elements(question, candidate_elements, model, tokenizer, theta=0.5):
 
 if __name__ == '__main__':
     TABLES_JSON = './tables.json'
-    QUESTIONS_JL = './questions.jsonl'
+    QUESTIONS_JL = './filtered_a.jsonl'
 
     global_schema = load_global_schema(TABLES_JSON)
     recs = load_questions(QUESTIONS_JL)
+    correct = 0
+    wrong = 0
+    total = 0
 
     examples = build_linking_examples(recs, global_schema, neg_ratio=1)
     # model, tok = train_linker(examples, output_dir='linker_out')
     model = BertForSequenceClassification.from_pretrained("./linker_out/")
     tokenizer = BertTokenizerFast.from_pretrained("./linker_out/")
-    rec0 = recs[0]
-    local_t, local_c = parse_schema(rec0['queries'])
-    elems = local_t + [f"{t}.{c}" for t in local_t for c in local_c[t]]
-    all_tbls = list(global_schema["department_management"].keys())
-    all_cols = [
-        f"{t}.{c}" for t in all_tbls for c in global_schema["department_management"][t]]
-    all_elems = all_tbls + all_cols
+    for rec in recs:
+        rec0 = rec
+        local_t, local_c = parse_schema(rec0['queries'])
+        db_id = rec0['db_id']
+        elems = local_t + [
+            f"{t}.{c}"
+            for t in local_t
+            for c in local_c.get(t, [])
+        ]
 
-    pruned = prune_elements(rec0['question'], all_elems,
-                            model, tokenizer, theta=0.72)
+        all_tbls = list(global_schema[db_id].keys())
+        all_cols = [
+            f"{t}.{c}" for t in all_tbls for c in global_schema[db_id][t]]
+        all_elems = all_tbls + all_cols
 
-    print("Question", rec0["question"], "Kept edges:",
-          pruned, "Start Edges:", elems)
+        pruned = prune_elements(rec0['question'], all_elems,
+                                model, tokenizer, theta=0.62)
+        print("Question", rec0["question"], "Kept edges:",
+              pruned, "Start Edges:", elems)
+
+        pruned = list(pruned.keys())
+        pruned = [v.replace(" ", "_") for v in pruned]
+        elems = [v.lower() for v in elems]
+        matches = set(elems) & set(pruned)
+        total += len(elems)
+        correct += len(matches)
+        wrong += len(set(pruned) - set(elems))
+
+    print("Wrong:", wrong, "\n Correct:", correct, "\n Total:", total)
