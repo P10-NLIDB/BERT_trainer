@@ -1,12 +1,13 @@
+from __future__ import annotations
 import json
 import random
 from collections import defaultdict
 import torch
 from torch.utils.data import Dataset
 import sqlparse
-from sqlparse.sql import IdentifierList, Identifier, Function
+from sqlparse.sql import IdentifierList, Identifier, Function, Token, TokenList
 from sqlparse.tokens import DML, Keyword, Punctuation
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Iterable
 import re
 from transformers import (
     BertTokenizerFast,
@@ -40,69 +41,117 @@ def load_global_schema(tables_json_path):
 # me get it to work - so this is what it is for now!
 
 
-def parse_schema(sql: str):
-    stmt = sqlparse.parse(sql[0])[0]
-    tables, columns = [], {}
-    in_from = False
-    in_select = False
-    for token in stmt.tokens:
-        if token.ttype is Keyword and token.value.upper() == 'FROM':
-            nxt = stmt.token_next(stmt.token_index(token), skip_ws=True)[1]
+def _safe_name(ident: Identifier | None) -> str | None:
+    """Return the real identifier name or None if it cannot be resolved."""
+    if ident is None:
+        return None
+    try:
+        return ident.get_real_name()
+    except AttributeError:
+        return None
+
+
+def _collect_tables(tokens: TokenList) -> list[str]:
+    """Return every table that appears after FROM or JOIN (recurses into groups)."""
+    tables: list[str] = []
+    for tok in tokens.tokens:
+        if tok.is_group:
+            tables.extend(_collect_tables(tok))
+        if tok.ttype is Keyword and tok.value.upper() in {"FROM", "JOIN"}:
+            nxt = tokens.token_next(tokens.token_index(tok), skip_ws=True)[1]
             if isinstance(nxt, IdentifierList):
-                for ident in nxt.get_identifiers():
-                    tables.append(ident.get_real_name())
+                tables.extend(i.get_real_name() for i in nxt.get_identifiers())
             elif isinstance(nxt, Identifier):
                 tables.append(nxt.get_real_name())
+    return tables
 
-    select_idx = next(i for i, t in enumerate(stmt.tokens)
-                      if t.ttype is DML and t.value.upper() == 'SELECT')
-    from_idx = next(i for i, t in enumerate(stmt.tokens)
-                    if t.ttype is Keyword and t.value.upper() == 'FROM')
 
-    for token in stmt.tokens[select_idx+1:from_idx]:
-        if token.is_whitespace or token.match(Punctuation, ','):
+def _add_column(tbl: str | None, col: str | None, acc: dict[str, list[str]]) -> None:
+    if tbl and col:
+        if col not in acc[tbl]:
+            acc[tbl].append(col)
+
+
+def _extract_columns(stmt: sqlparse.sql.Statement, tables: list[str]) -> dict[str, list[str]]:
+    cols: dict[str, list[str]] = defaultdict(list)
+
+    # Locate SELECT … FROM slice.
+    try:
+        select_idx = next(i for i, t in enumerate(stmt.tokens)
+                          if t.ttype is DML and t.value.upper() == "SELECT")
+        from_idx = next(i for i, t in enumerate(stmt.tokens)
+                        if t.ttype is Keyword and t.value.upper() == "FROM")
+    except StopIteration:
+        return cols  # malformed; bail out
+
+    slice_tokens = stmt.tokens[select_idx + 1: from_idx]
+
+    for tok in slice_tokens:
+        if tok.is_whitespace or tok.match(Punctuation, ","):
             continue
 
-        if isinstance(token, IdentifierList):
-            for ident in token.get_identifiers():
-                try:
-                    col = ident.get_real_name()
-                except AttributeError:
+        # Drill into nested structures.
+        targets = tok if isinstance(tok, (IdentifierList, Identifier, Function)) else tok.flatten()
+        for sub in (targets if isinstance(targets, list) else [targets]):
+            if isinstance(sub, IdentifierList):
+                for ident in sub.get_identifiers():
+                    _add_column(
+                        ident.get_parent_name() if isinstance(ident, sqlparse.sql.Identifier) else ident._get_repr_name() if isinstance(ident, sqlparse.sql.Token) else (tables[0] if len(set(tables)) == 1 else None),
+                        _safe_name(ident),
+                        cols,
+                    )
+            elif isinstance(sub, Identifier):
+                _add_column(
+                    sub.get_parent_name() or (tables[0] if len(set(tables)) == 1 else None),
+                    _safe_name(sub),
+                    cols,
+                )
+            elif isinstance(sub, Function):
+                inside = re.search(r"\(([^)]+)\)", sub.value)
+                if not inside:
                     continue
-                tbl = ident.get_parent_name() or (
-                    tables[0] if len(tables) == 1 else None)
-                if tbl:
-                    if tbl in columns:
-                        columns[tbl].append(col)
-                    else:
-                        columns[tbl] = [col]
+                for arg in inside.group(1).split(","):
+                    arg = arg.strip()
+                    tbl, col = (arg.split(".", 1) if "." in arg else
+                                ((tables[0] if len(set(tables)) == 1 else None), arg))
+                    _add_column(tbl, col, cols)
+    return cols
 
-        elif isinstance(token, Identifier):
-            col = token.get_real_name()
-            tbl = token.get_parent_name() or (
-                tables[0] if len(tables) == 1 else None)
-            if tbl and tbl in columns:
-                columns[tbl].append(col)
-            elif tbl:
-                columns[tbl] = [col]
 
-        elif isinstance(token, Function):
-            inside = re.search(r'\(([^)]+)\)', token.value)
-            if not inside:
-                continue
-            args = inside.group(1).split(',')
-            for arg in args:
-                arg = arg.strip()
-                if '.' in arg:
-                    tbl, col = arg.split('.', 1)
-                else:
-                    col = arg
-                    tbl = tables[0] if len(tables) == 1 else None
-                if tbl and tbl in columns:
-                    columns[tbl].append(col)
-                elif tbl:
-                    columns[tbl] = [col]
-    return tables, dict(columns)
+def parse_schema(sql: Iterable[str]) -> Tuple[List[str], Dict[str, List[str]]]:
+    """
+    Extract tables and columns from a collection of SQL strings.
+
+    Returns
+    -------
+    tables : list[str]
+        Unique table names in first-appearance order.
+    columns : dict[str, list[str]]
+        Mapping table -> list(unique column names in order).
+    """
+    tables_ordered: list[str] = []
+    columns: dict[str, list[str]] = defaultdict(list)
+
+    for raw in sql:
+        if not raw:
+            continue
+        try:
+            stmt = sqlparse.parse(raw)[0]
+        except Exception:
+            continue  # garbage in, ignore
+
+        tbls = _collect_tables(stmt)
+        for t in tbls:
+            if t not in tables_ordered:
+                tables_ordered.append(t)
+
+        for t, cols in _extract_columns(stmt, tbls).items():
+            for c in cols:
+                if c not in columns[t]:
+                    columns[t].append(c)
+
+    return tables_ordered, dict(columns)
+
 
 
 def load_questions(jsonl_path):
