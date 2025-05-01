@@ -41,94 +41,98 @@ def load_global_schema(tables_json_path):
 # me get it to work - so this is what it is for now!
 
 
-def _safe_name(ident: Identifier | None) -> str | None:
-    """Return the real identifier name or None if it cannot be resolved."""
-    if ident is None:
-        return None
-    try:
-        return ident.get_real_name()
-    except AttributeError:
-        return None
-
-
-def _collect_tables(tokens: TokenList) -> list[str]:
-    """Return every table that appears after FROM or JOIN (recurses into groups)."""
+def _collect_tables_aliases(tokens: TokenList) -> tuple[list[str], dict[str, str]]:
+    """
+    Return (tables, alias_map) for every base-table that follows FROM / JOIN.
+    Recurses into nested groups.
+    """
     tables: list[str] = []
+    alias_map: dict[str, str] = {}
+
     for tok in tokens.tokens:
-        if tok.is_group:
-            tables.extend(_collect_tables(tok))
+        if tok.is_group:                    
+            t, a = _collect_tables_aliases(tok)
+            for name in t:
+                if name not in tables:
+                    tables.append(name)
+            alias_map.update(a)
+
         if tok.ttype is Keyword and tok.value.upper() in {"FROM", "JOIN"}:
             nxt = tokens.token_next(tokens.token_index(tok), skip_ws=True)[1]
-            if isinstance(nxt, IdentifierList):
-                tables.extend(i.get_real_name() for i in nxt.get_identifiers())
-            elif isinstance(nxt, Identifier):
-                tables.append(nxt.get_real_name())
-    return tables
+            items = (nxt.get_identifiers() if isinstance(nxt, IdentifierList)
+                     else [nxt])
+
+            for ident in items:
+                if not isinstance(ident, Identifier):
+                    continue
+                real = ident.get_real_name()
+                alias = ident.get_alias() or real
+                if real and real not in tables:
+                    tables.append(real)
+                if alias:
+                    alias_map[alias] = real
+    return tables, alias_map
 
 
-def _add_column(tbl: str | None, col: str | None, acc: dict[str, list[str]]) -> None:
-    if tbl and col:
-        if col not in acc[tbl]:
-            acc[tbl].append(col)
+def _extract_columns(stmt, tables, alias_map):
+    cols = defaultdict(list)
 
-
-def _extract_columns(stmt: sqlparse.sql.Statement, tables: list[str]) -> dict[str, list[str]]:
-    cols: dict[str, list[str]] = defaultdict(list)
-
-    # Locate SELECT … FROM slice.
+    # find our SELECT … FROM slice
     try:
-        select_idx = next(i for i, t in enumerate(stmt.tokens)
-                          if t.ttype is DML and t.value.upper() == "SELECT")
-        from_idx = next(i for i, t in enumerate(stmt.tokens)
-                        if t.ttype is Keyword and t.value.upper() == "FROM")
+        # generators are motherfucking awesome
+        sel_i = next(i for i,t in enumerate(stmt.tokens)
+                     if t.ttype is DML and t.value.upper()=='SELECT')
+        frm_i = next(i for i,t in enumerate(stmt.tokens)
+                     if t.ttype is Keyword and t.value.upper()=='FROM')
     except StopIteration:
-        return cols  # malformed; bail out
+        return cols
 
-    slice_tokens = stmt.tokens[select_idx + 1: from_idx]
-
-    for tok in slice_tokens:
-        if tok.is_whitespace or tok.match(Punctuation, ","):
+    for token in stmt.tokens[sel_i+1:frm_i]:
+        if token.is_whitespace or token.match(Punctuation, ','):
             continue
 
-        # Drill into nested structures.
-        targets = tok if isinstance(tok, (IdentifierList, Identifier, Function)) else tok.flatten()
-        for sub in (targets if isinstance(targets, list) else [targets]):
-            if isinstance(sub, IdentifierList):
-                for ident in sub.get_identifiers():
-                    _add_column(
-                        ident.get_parent_name() if isinstance(ident, sqlparse.sql.Identifier) else ident._get_repr_name() if isinstance(ident, sqlparse.sql.Token) else (tables[0] if len(set(tables)) == 1 else None),
-                        _safe_name(ident),
-                        cols,
-                    )
-            elif isinstance(sub, Identifier):
-                _add_column(
-                    sub.get_parent_name() or (tables[0] if len(set(tables)) == 1 else None),
-                    _safe_name(sub),
-                    cols,
-                )
-            elif isinstance(sub, Function):
-                inside = re.search(r"\(([^)]+)\)", sub.value)
-                if not inside:
-                    continue
-                for arg in inside.group(1).split(","):
-                    arg = arg.strip()
-                    tbl, col = (arg.split(".", 1) if "." in arg else
-                                ((tables[0] if len(set(tables)) == 1 else None), arg))
-                    _add_column(tbl, col, cols)
+        # Collect the identifiers or functions in this token
+        if isinstance(token, IdentifierList):
+            items = list(token.get_identifiers())
+        elif isinstance(token, Identifier) or isinstance(token, Function):
+            items = [token]
+        else:
+            continue
+
+        for it in items:
+            # 1) plain column or aliased column
+            if isinstance(it, Identifier):
+                col = it.get_real_name()
+                parent = it.get_parent_name()
+            # 2) function call, e.g. COUNT(t2.id)
+            else:  # Function
+                col = None
+                parent = None
+                inside = re.search(r'\(([^)]+)\)', it.value)
+                if inside:
+                    # handle only the first arg
+                    arg = inside.group(1).split(',',1)[0].strip()
+                    if '.' in arg:
+                        parent, col = arg.split('.',1)
+                    else:
+                        col = arg
+
+            # map alias to real table
+            real_tbl = None
+            if parent:
+                real_tbl = alias_map.get(parent, parent)
+            elif len(tables)==1:
+                real_tbl = tables[0]
+
+            if real_tbl and col:
+                if col not in cols[real_tbl]:
+                    cols[real_tbl].append(col)
+
     return cols
 
 
-def parse_schema(sql: Iterable[str]) -> Tuple[List[str], Dict[str, List[str]]]:
-    """
-    Extract tables and columns from a collection of SQL strings.
 
-    Returns
-    -------
-    tables : list[str]
-        Unique table names in first-appearance order.
-    columns : dict[str, list[str]]
-        Mapping table -> list(unique column names in order).
-    """
+def parse_schema(sql: Iterable[str]) -> Tuple[List[str], Dict[str, List[str]]]:
     tables_ordered: list[str] = []
     columns: dict[str, list[str]] = defaultdict(list)
 
@@ -138,14 +142,14 @@ def parse_schema(sql: Iterable[str]) -> Tuple[List[str], Dict[str, List[str]]]:
         try:
             stmt = sqlparse.parse(raw)[0]
         except Exception:
-            continue  # garbage in, ignore
+            continue   # skip garbage
 
-        tbls = _collect_tables(stmt)
+        tbls, alias_map = _collect_tables_aliases(stmt)
         for t in tbls:
             if t not in tables_ordered:
                 tables_ordered.append(t)
 
-        for t, cols in _extract_columns(stmt, tbls).items():
+        for t, cols in _extract_columns(stmt, tbls, alias_map).items():
             for c in cols:
                 if c not in columns[t]:
                     columns[t].append(c)
@@ -160,9 +164,6 @@ def load_questions(jsonl_path):
         for line in f:
             recs.append(json.loads(line))
     return recs
-
-# Build positive and negative examples for training - ration controls the ratio of negative examples to
-# positives
 
 
 def build_linking_examples(recs, global_schema, neg_ratio=1):
@@ -179,7 +180,11 @@ def build_linking_examples(recs, global_schema, neg_ratio=1):
         ]
 
         all_tbls = list(global_schema[db].keys())
-        all_cols = [f"{t}.{c}" for t in all_tbls for c in global_schema[db][t]]
+        all_cols = [
+            f"{t}.{c}"
+            for t in all_tbls
+            for c in global_schema[db][t]
+        ]
         all_elems = all_tbls + all_cols
 
         neg_cand = [e for e in all_elems if e not in pos]
@@ -273,25 +278,35 @@ def prune_elements(question, candidate_elements, model, tokenizer, theta=0.5):
 
 if __name__ == '__main__':
     TABLES_JSON = './tables.json'
-    QUESTIONS_JL = './questions.jsonl'
+    QUESTIONS_JL = './GNN_Train_collect_with_type.jsonl'
 
     global_schema = load_global_schema(TABLES_JSON)
     recs = load_questions(QUESTIONS_JL)
 
     examples = build_linking_examples(recs, global_schema, neg_ratio=1)
-    # model, tok = train_linker(examples, output_dir='linker_out')
+    model, tok = train_linker(examples, output_dir='linker_out')
     model = BertForSequenceClassification.from_pretrained("./linker_out/")
     tokenizer = BertTokenizerFast.from_pretrained("./linker_out/")
-    rec0 = recs[0]
-    local_t, local_c = parse_schema(rec0['queries'])
-    elems = local_t + [f"{t}.{c}" for t in local_t for c in local_c[t]]
-    all_tbls = list(global_schema["department_management"].keys())
-    all_cols = [
-        f"{t}.{c}" for t in all_tbls for c in global_schema["department_management"][t]]
-    all_elems = all_tbls + all_cols
+    edges = []
+    for rec in recs:
+        db_id = rec["db_id"]
+        local_t, local_c = parse_schema(rec['queries'])
+        print(f"Tables: {local_t} \n Columns: {local_c}")
+        elems = local_t + [f"{t}.{c}" for t in local_t if t in local_c for c in local_c[t]]
+        all_tbls = list(global_schema[db_id].keys())
+        all_cols = [
+            f"{t}.{c}"
+            for t in all_tbls
+            for c in global_schema[db_id][t]
+        ]
+        print(all_cols)
+        all_elems = all_tbls + all_cols
 
-    pruned = prune_elements(rec0['question'], all_elems,
-                            model, tokenizer, theta=0.72)
-
-    print("Question", rec0["question"], "Kept edges:",
-          pruned, "Start Edges:", elems)
+        pruned = prune_elements(rec['question'], all_elems,
+                                model, tokenizer, theta=0.1)
+        
+        print("Question", rec["question"], "Kept edges:",
+              pruned, "Start Edges:", elems)
+        edges.append(pruned)
+    with open("./weighed_edges.json", "r") as fp:   
+        json.dump(edges, fp)
