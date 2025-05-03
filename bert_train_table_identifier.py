@@ -15,6 +15,14 @@ from transformers import (
     Trainer,
     TrainingArguments
 )
+import numpy as np
+from sklearn.metrics import roc_auc_score, accuracy_score
+from sklearn.model_selection import train_test_split
+import nltk
+from nltk import word_tokenize, pos_tag
+from nltk.corpus import wordnet
+from nltk.stem import WordNetLemmatizer
+
 
 # Load all tables and columns for all databses in Spider
 
@@ -203,6 +211,20 @@ def build_linking_examples(recs, global_schema, neg_ratio=1):
 
 
 # Preproccesing of dataset for training
+
+def compute_metrics(pred):
+    labels = pred.label_ids
+    scores = pred.predictions.squeeze(-1)
+    probs = 1 / (1 + np.exp(-scores))  # Sigmoid
+
+    preds = (probs >= 0.5).astype(int)
+    
+    return {
+        'accuracy': accuracy_score(labels, preds),
+        'auc': roc_auc_score(labels, probs)
+    }
+
+
 class LinkDataset(Dataset):
     def __init__(self, examples, tokenizer, max_length=64):
         self.ex = examples
@@ -235,6 +257,11 @@ class LinkDataset(Dataset):
 def train_linker(examples, output_dir='linker_out'):
     tok = BertTokenizerFast.from_pretrained('bert-base-uncased')
     ds = LinkDataset(examples, tok)
+    tok = BertTokenizerFast.from_pretrained('bert-base-uncased')
+    train_ex, val_ex = train_test_split(examples, test_size=0.1, random_state=42)
+    train_ds = LinkDataset(train_ex, tok)
+    val_ds = LinkDataset(val_ex, tok)
+    
     model = BertForSequenceClassification.from_pretrained(
         'bert-base-uncased',
         num_labels=1,
@@ -245,14 +272,21 @@ def train_linker(examples, output_dir='linker_out'):
         per_device_train_batch_size=32,
         num_train_epochs=3,
         learning_rate=3e-5,
-        logging_steps=100
+        logging_steps=100,
+        evaluation_strategy="epoch", 
+        logging_dir=f'{output_dir}/logs',
+        save_total_limit=1,
+        save_strategy="epoch"
     )
     trainer = Trainer(
         model=model,
         args=args,
-        train_dataset=ds
+        train_dataset=train_ds,
+        eval_dataset=val_ds, 
+        compute_metrics=compute_metrics
     )
-    trainer.train()
+    checkpoint_path = "./linker_out/checkpoint-16929"
+    trainer.train(resume_from_checkpoint=checkpoint_path)
     model.save_pretrained(output_dir)
     tok.save_pretrained(output_dir)
     return model, tok
@@ -276,7 +310,25 @@ def prune_elements(question, candidate_elements, model, tokenizer, theta=0.5):
     }
 
 
+def get_wntag(treebank_tag):
+    if treebank_tag.startswith('J'):
+        return wordnet.ADJ
+    elif treebank_tag.startswith('V'):
+        return wordnet.VERB
+    elif treebank_tag.startswith('R'):
+        return wordnet.ADV
+    else:
+        return wordnet.NOUN
+       
+
 if __name__ == '__main__':
+    nltk.download('punkt_tab')
+    nltk.download('punkt')        # for word_tokenize
+    nltk.download('averaged_perceptron_tagger')  # for pos_tag
+    nltk.download('wordnet')      # for WordNetLemmatizer
+    nltk.download('omw-1.4') 
+    nltk.download('averaged_perceptron_tagger_eng')
+
     TABLES_JSON = './tables.json'
     QUESTIONS_JL = './GNN_Train_collect_with_type.jsonl'
 
@@ -284,11 +336,12 @@ if __name__ == '__main__':
     recs = load_questions(QUESTIONS_JL)
 
     examples = build_linking_examples(recs, global_schema, neg_ratio=1)
+    train_ex, val_ex = train_test_split(examples, test_size=0.1, random_state=42)
     model, tok = train_linker(examples, output_dir='linker_out')
     model = BertForSequenceClassification.from_pretrained("./linker_out/")
     tokenizer = BertTokenizerFast.from_pretrained("./linker_out/")
     edges = []
-    for rec in recs:
+    for i, rec in enumerate(recs):
         db_id = rec["db_id"]
         local_t, local_c = parse_schema(rec['queries'])
         print(f"Tables: {local_t} \n Columns: {local_c}")
@@ -300,13 +353,31 @@ if __name__ == '__main__':
             for c in global_schema[db_id][t]
         ]
         print(all_cols)
-        all_elems = all_tbls + all_cols
 
-        pruned = prune_elements(rec['question'], all_elems,
+ 
+        lemmatizer = WordNetLemmatizer()
+        all_elems = all_tbls + all_cols
+        question = rec["question"]
+        question = question.lower()
+        question = rec["question"].lower()
+        question = re.sub('[^a-z0-9]', ' ', question)
+        tokens   = word_tokenize(question)
+
+        pos_tags = pos_tag(tokens)
+        lemmas   = [
+            lemmatizer.lemmatize(tok, get_wntag(tag))
+            for tok, tag in pos_tags
+        ]
+        lemma_question = " ".join(lemmas)
+
+
+
+        pruned = prune_elements(lemma_question, all_elems,
                                 model, tokenizer, theta=0.1)
         
         print("Question", rec["question"], "Kept edges:",
               pruned, "Start Edges:", elems)
-        edges.append(pruned)
-    with open("./weighed_edges.json", "r") as fp:   
+        edges.append({"index": i, "Nodes Weighed": pruned,  "Nodes in Question": elems, "Question": rec["question"], "is_ambiguous": rec["is_ambiguous"]})
+
+    with open("./weighed_nodes.json", "w") as fp:   
         json.dump(edges, fp)
