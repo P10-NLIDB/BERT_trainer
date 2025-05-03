@@ -58,7 +58,7 @@ def _collect_tables_aliases(tokens: TokenList) -> tuple[list[str], dict[str, str
     alias_map: dict[str, str] = {}
 
     for tok in tokens.tokens:
-        if tok.is_group:                    
+        if tok.is_group:
             t, a = _collect_tables_aliases(tok)
             for name in t:
                 if name not in tables:
@@ -88,10 +88,10 @@ def _extract_columns(stmt, tables, alias_map):
     # find our SELECT … FROM slice
     try:
         # generators are motherfucking awesome
-        sel_i = next(i for i,t in enumerate(stmt.tokens)
-                     if t.ttype is DML and t.value.upper()=='SELECT')
-        frm_i = next(i for i,t in enumerate(stmt.tokens)
-                     if t.ttype is Keyword and t.value.upper()=='FROM')
+        sel_i = next(i for i, t in enumerate(stmt.tokens)
+                     if t.ttype is DML and t.value.upper() == 'SELECT')
+        frm_i = next(i for i, t in enumerate(stmt.tokens)
+                     if t.ttype is Keyword and t.value.upper() == 'FROM')
     except StopIteration:
         return cols
 
@@ -119,9 +119,9 @@ def _extract_columns(stmt, tables, alias_map):
                 inside = re.search(r'\(([^)]+)\)', it.value)
                 if inside:
                     # handle only the first arg
-                    arg = inside.group(1).split(',',1)[0].strip()
+                    arg = inside.group(1).split(',', 1)[0].strip()
                     if '.' in arg:
-                        parent, col = arg.split('.',1)
+                        parent, col = arg.split('.', 1)
                     else:
                         col = arg
 
@@ -129,7 +129,7 @@ def _extract_columns(stmt, tables, alias_map):
             real_tbl = None
             if parent:
                 real_tbl = alias_map.get(parent, parent)
-            elif len(tables)==1:
+            elif len(tables) == 1:
                 real_tbl = tables[0]
 
             if real_tbl and col:
@@ -137,7 +137,6 @@ def _extract_columns(stmt, tables, alias_map):
                     cols[real_tbl].append(col)
 
     return cols
-
 
 
 def parse_schema(sql: Iterable[str]) -> Tuple[List[str], Dict[str, List[str]]]:
@@ -163,7 +162,6 @@ def parse_schema(sql: Iterable[str]) -> Tuple[List[str], Dict[str, List[str]]]:
                     columns[t].append(c)
 
     return tables_ordered, dict(columns)
-
 
 
 def load_questions(jsonl_path):
@@ -218,7 +216,7 @@ def compute_metrics(pred):
     probs = 1 / (1 + np.exp(-scores))  # Sigmoid
 
     preds = (probs >= 0.5).astype(int)
-    
+
     return {
         'accuracy': accuracy_score(labels, preds),
         'auc': roc_auc_score(labels, probs)
@@ -258,35 +256,36 @@ def train_linker(examples, output_dir='linker_out'):
     tok = BertTokenizerFast.from_pretrained('bert-base-uncased')
     ds = LinkDataset(examples, tok)
     tok = BertTokenizerFast.from_pretrained('bert-base-uncased')
-    train_ex, val_ex = train_test_split(examples, test_size=0.1, random_state=42)
+    train_ex, val_ex = train_test_split(
+        examples, test_size=0.1, random_state=42)
     train_ds = LinkDataset(train_ex, tok)
     val_ds = LinkDataset(val_ex, tok)
-    
+
     model = BertForSequenceClassification.from_pretrained(
         'bert-base-uncased',
         num_labels=1,
         problem_type='regression'
     )
     args = TrainingArguments(
-        output_dir=output_dir,
+        output_dir="linker_out",
         per_device_train_batch_size=32,
         num_train_epochs=3,
         learning_rate=3e-5,
-        logging_steps=100,
-        evaluation_strategy="epoch", 
-        logging_dir=f'{output_dir}/logs',
-        save_total_limit=1,
-        save_strategy="epoch"
+        save_strategy="epoch",
+        logging_strategy="epoch",
+        eval_strategy="epoch",
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        save_total_limit=2,
     )
     trainer = Trainer(
         model=model,
         args=args,
         train_dataset=train_ds,
-        eval_dataset=val_ds, 
+        eval_dataset=val_ds,
         compute_metrics=compute_metrics
     )
-    checkpoint_path = "./linker_out/checkpoint-16929"
-    trainer.train(resume_from_checkpoint=checkpoint_path)
+    trainer.train()
     model.save_pretrained(output_dir)
     tok.save_pretrained(output_dir)
     return model, tok
@@ -319,14 +318,14 @@ def get_wntag(treebank_tag):
         return wordnet.ADV
     else:
         return wordnet.NOUN
-       
+
 
 if __name__ == '__main__':
     nltk.download('punkt_tab')
     nltk.download('punkt')        # for word_tokenize
     nltk.download('averaged_perceptron_tagger')  # for pos_tag
     nltk.download('wordnet')      # for WordNetLemmatizer
-    nltk.download('omw-1.4') 
+    nltk.download('omw-1.4')
     nltk.download('averaged_perceptron_tagger_eng')
 
     TABLES_JSON = './tables.json'
@@ -336,7 +335,8 @@ if __name__ == '__main__':
     recs = load_questions(QUESTIONS_JL)
 
     examples = build_linking_examples(recs, global_schema, neg_ratio=1)
-    train_ex, val_ex = train_test_split(examples, test_size=0.1, random_state=42)
+    train_ex, val_ex = train_test_split(
+        examples, test_size=0.1, random_state=42)
     model, tok = train_linker(examples, output_dir='linker_out')
     model = BertForSequenceClassification.from_pretrained("./linker_out/")
     tokenizer = BertTokenizerFast.from_pretrained("./linker_out/")
@@ -345,7 +345,8 @@ if __name__ == '__main__':
         db_id = rec["db_id"]
         local_t, local_c = parse_schema(rec['queries'])
         print(f"Tables: {local_t} \n Columns: {local_c}")
-        elems = local_t + [f"{t}.{c}" for t in local_t if t in local_c for c in local_c[t]]
+        elems = local_t + \
+            [f"{t}.{c}" for t in local_t if t in local_c for c in local_c[t]]
         all_tbls = list(global_schema[db_id].keys())
         all_cols = [
             f"{t}.{c}"
@@ -354,30 +355,28 @@ if __name__ == '__main__':
         ]
         print(all_cols)
 
- 
         lemmatizer = WordNetLemmatizer()
         all_elems = all_tbls + all_cols
         question = rec["question"]
         question = question.lower()
         question = rec["question"].lower()
         question = re.sub('[^a-z0-9]', ' ', question)
-        tokens   = word_tokenize(question)
+        tokens = word_tokenize(question)
 
         pos_tags = pos_tag(tokens)
-        lemmas   = [
+        lemmas = [
             lemmatizer.lemmatize(tok, get_wntag(tag))
             for tok, tag in pos_tags
         ]
         lemma_question = " ".join(lemmas)
 
-
-
         pruned = prune_elements(lemma_question, all_elems,
                                 model, tokenizer, theta=0.1)
-        
+
         print("Question", rec["question"], "Kept edges:",
               pruned, "Start Edges:", elems)
-        edges.append({"index": i, "Nodes Weighed": pruned,  "Nodes in Question": elems, "Question": rec["question"], "is_ambiguous": rec["is_ambiguous"]})
+        edges.append({"index": i, "Nodes Weighed": pruned,  "Nodes in Question": elems,
+                     "Question": rec["question"], "is_ambiguous": rec["is_ambiguous"]})
 
-    with open("./weighed_nodes.json", "w") as fp:   
+    with open("./weighed_nodes.json", "w") as fp:
         json.dump(edges, fp)
